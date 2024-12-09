@@ -1,5 +1,6 @@
 # Environment variables
 .env
+.myenv
 config/local_config.py
 
 # Python
@@ -29,6 +30,8 @@ venv/
 ENV/
 env/
 .env/
+myenv/
+.myenv/
 
 # IDE
 .idea/

@@ -1,13 +1,14 @@
 import streamlit as st
 import pandas as pd
-from notion_ops import NotionOperator
+from notion.api import NotionOperator
 import os
 from typing import Dict, Any
+from dotenv import load_dotenv
+from excel.processor import ExcelProcessor
+from config.config import COMMON_CONFIG, EXCEL_CONFIG, NOTION_CONFIG, merge_config
+from datetime import datetime
 import logging
 import tempfile
-from dotenv import load_dotenv
-from datetime import datetime
-from config.notion_config import NOTION_CONFIG
 
 # Load environment variables
 load_dotenv()
@@ -39,7 +40,11 @@ def init_notion_client() -> NotionOperator:
     token = os.getenv("NOTION_TOKEN")
     if not token:
         raise ValueError("NOTION_TOKEN environment variable is not set. Please check your .env file.")
-    return NotionOperator(token=token, config=NOTION_CONFIG)
+    return NotionOperator(notion_token=token, config=NOTION_CONFIG)
+
+def init_excel_processor() -> ExcelProcessor:
+    """Initialize Excel processor with configuration"""
+    return ExcelProcessor(config=EXCEL_CONFIG)
 
 def main():
     # Initialize session state
@@ -56,11 +61,12 @@ def main():
     
     st.title("Notion Project Automator 📊")
     
-    # Initialize Notion client
+    # Initialize processors
     try:
         notion = init_notion_client()
+        excel_processor = init_excel_processor()
     except Exception as e:
-        st.error(f"Failed to initialize Notion client: {str(e)}")
+        st.error(f"Failed to initialize processors: {str(e)}")
         return
 
     # File uploader section
@@ -127,22 +133,85 @@ def main():
                     tmp_file.write(current_file.getvalue())
                     temp_path = tmp_file.name
 
-                # Process the file
-                project_info = notion.extract_project_info(temp_path)
-                if not project_info:
+                # Process the file using excel_processor
+                project_info = excel_processor.get_project_info(temp_path)
+                if not project_info['name'] or not project_info['id']:
                     st.error(f"❌ Could not extract project information from {current_file.name}")
                     if st.button("Skip File"):
                         st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
                         st.experimental_rerun()
                     return
 
-                notion_structure, stats = notion.process_excel_data(temp_path)
+                # Process the Excel data
+                notion_structure, stats, metadata = excel_processor.process_excel_data(temp_path)
+
+                # Header verification step
+                st.subheader("2. Verify Headers")
+                st.write("Please verify that your Excel headers match the expected Notion headers:")
                 
+                # Get expected headers from config
+                required_headers = {
+                    'EDT': excel_processor.config.task_columns.edt,
+                    'Title': excel_processor.config.task_columns.title,
+                    'Status': excel_processor.config.task_columns.status,
+                    'Progress': excel_processor.config.task_columns.progress,
+                    'Planned Start': excel_processor.config.task_columns.planned_start,
+                    'Planned End': excel_processor.config.task_columns.planned_end,
+                    'Actual Start': excel_processor.config.task_columns.actual_start,
+                    'Actual End': excel_processor.config.task_columns.actual_end,
+                }
+                
+                optional_headers = {
+                    'Type': excel_processor.config.task_columns.type,
+                }
+                
+                # Get actual headers from the DataFrame
+                actual_headers = list(metadata['headers'])
+                
+                # Create a comparison DataFrame for required headers
+                comparison_data = []
+                for field, expected in required_headers.items():
+                    found = expected in actual_headers
+                    comparison_data.append({
+                        'Field': field,
+                        'Expected Header': expected,
+                        'Required': '✅',
+                        'Found': '✅' if found else '❌'
+                    })
+                
+                # Add optional headers to comparison
+                for field, expected in optional_headers.items():
+                    found = expected in actual_headers
+                    comparison_data.append({
+                        'Field': field,
+                        'Expected Header': expected,
+                        'Required': '❌',
+                        'Found': '✅' if found else '❌'
+                    })
+                
+                comparison_df = pd.DataFrame(comparison_data)
+                st.dataframe(comparison_df, use_container_width=True)
+                
+                # Check if all required headers are present
+                missing_headers = [h for h in required_headers.values() if h not in actual_headers]
+                if missing_headers:
+                    st.error(f"❌ Missing required headers: {', '.join(missing_headers)}")
+                    if st.button("Skip File"):
+                        st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
+                        st.experimental_rerun()
+                    return
+                
+                # Ask for user confirmation
+                if not st.checkbox("I confirm that the headers are correct", key=f"header_confirm_{current_file.name}"):
+                    st.info("Please confirm the headers are correct to proceed with the upload")
+                    return
+
                 # Store processed data in session state
                 st.session_state.processed_files[current_file.name] = {
                     'project_info': project_info,
-                    'notion_structure': notion_structure,
-                    'stats': stats
+                    'stats': stats,
+                    'metadata': metadata,
+                    'notion_structure': notion_structure
                 }
 
             except Exception as e:
@@ -161,8 +230,9 @@ def main():
         # Get processed data
         file_data = st.session_state.processed_files[current_file.name]
         project_info = file_data['project_info']
-        notion_structure = file_data['notion_structure']
         stats = file_data['stats']
+        metadata = file_data['metadata']
+        notion_structure = file_data['notion_structure']
         
         # Create tabs for the current file
         tab1, tab2, tab3 = st.tabs([
@@ -172,15 +242,26 @@ def main():
         ])
         
         with tab1:
-            st.json(project_info)
+            st.markdown(f"""
+            ### Project Information
+            - **Name**: {project_info['name']}
+            - **ID**: {project_info['id']}
+            
+            📊 **File Statistics:**
+            - Total Phases: {stats['total_phases']}
+            - Total Tasks: {stats['total_tasks']}
+            - Total Milestones: {stats['total_milestones']}
+            """)
             
         with tab2:
             st.dataframe(notion_structure)
-            st.json(stats)
             
         with tab3:
             st.subheader("Similar Projects Check")
-            similar_projects = notion.find_similar_projects(project_info['name'])
+            similar_projects = notion.projects.find_similar_projects(
+                project_info['name'],  # Use consistent 'name' key
+                project_info['id']
+            )
             
             selected_project = None
             if similar_projects:
@@ -188,12 +269,19 @@ def main():
                     st.write("Select a project to add tasks to, or create a new one:")
                     
                     # Add "Create New Project" option
-                    project_options = [{"name": "📌 Create New Project", "id": None, "url": None}] + similar_projects
+                    project_options = [{"Project name": "📌 Create New Project", "id": None, "url": None}] + [
+                        {
+                            "Project name": result.get("properties", {}).get("Project name", {}).get("title", [{}])[0].get("text", {}).get("content", "Untitled"),
+                            "id": result.get("id"),
+                            "url": result.get("url")
+                        }
+                        for result in similar_projects
+                    ]
                     
                     selected_idx = st.radio(
                         "Project Selection",
                         range(len(project_options)),
-                        format_func=lambda i: project_options[i]["name"],
+                        format_func=lambda i: project_options[i]["Project name"],
                         key=f"project_select_{current_file.name}"
                     )
                     
@@ -227,18 +315,27 @@ def main():
                     if st.button("🚀 Upload to Notion"):
                         try:
                             project = None
-                            if selected_project and selected_project["id"]:
+                            if selected_project and selected_project.get("id"):
                                 # Use existing project
-                                update_log(f"Adding tasks to existing project '{selected_project['name']}'...", "info")
+                                update_log(f"Adding tasks to existing project '{selected_project['Project name']}'...", "info")
                                 project = selected_project
                             else:
                                 # Create new project
                                 update_log(f"Creating new project '{project_info['name']}'...", "info")
-                                project = notion.create_project(project_info)
-                            
+                                try:
+                                    project = notion.projects.create_project(project_info)
+                                    if not project:
+                                        update_log("Failed to create project", "error")
+                                        st.error("❌ Failed to create project")
+                                        return
+                                except Exception as e:
+                                    update_log(f"Error creating project: {str(e)}", "error")
+                                    st.error(f"❌ Error creating project: {str(e)}")
+                                    return
+                        
                             if project:
-                                if selected_project and selected_project["id"]:
-                                    update_log(f"Using existing project '{selected_project['name']}'", "success")
+                                if selected_project and selected_project.get("id"):
+                                    update_log(f"Using existing project '{selected_project['Project name']}'", "success")
                                 else:
                                     update_log(f"Project '{project_info['name']}' created successfully", "success")
                                 
@@ -247,10 +344,10 @@ def main():
                                 skip_count = 0
                                 error_count = 0
                                 
-                                update_log(f"Creating {total_tasks} tasks...", "info")
+                                update_log(f"Creating {total_tasks} tasks (excluding phases)...", "info")
                                 for idx, task in notion_structure.iterrows():
                                     try:
-                                        response = notion.create_or_update_task(task, project["id"])
+                                        response = notion.tasks.create_or_update_task(task, project["id"])
                                         if response is None:
                                             update_log(f"Task '{task['Tarefa']}' already exists, skipped", "warning")
                                             skip_count += 1
