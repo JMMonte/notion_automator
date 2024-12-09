@@ -139,7 +139,6 @@ def main():
                     st.error(f"❌ Could not extract project information from {current_file.name}")
                     if st.button("Skip File"):
                         st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                        st.experimental_rerun()
                     return
 
                 # Process the Excel data
