@@ -197,7 +197,6 @@ def main():
                     st.error(f"❌ Missing required headers: {', '.join(missing_headers)}")
                     if st.button("Skip File"):
                         st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                        st.experimental_rerun()
                     return
                 
                 # Ask for user confirmation
@@ -217,7 +216,6 @@ def main():
                 st.error(f"❌ Error processing {current_file.name}: {str(e)}")
                 if st.button("Skip File"):
                     st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                    st.experimental_rerun()
                 return
             finally:
                 # Clean up temporary file
@@ -343,18 +341,19 @@ def main():
                                 skip_count = 0
                                 error_count = 0
                                 
-                                update_log(f"Creating {total_tasks} tasks (excluding phases)...", "info")
+                                update_log(f"Creating {total_tasks} tasks...", "info")
                                 for idx, task in notion_structure.iterrows():
                                     try:
+                                        task_name = task[notion.tasks._field_mappings["title"]["notion"]]
                                         response = notion.tasks.create_or_update_task(task, project["id"])
                                         if response is None:
-                                            update_log(f"Task '{task['Tarefa']}' already exists, skipped", "warning")
+                                            update_log(f"Task '{task_name}' already exists, skipped", "warning")
                                             skip_count += 1
                                         else:
-                                            update_log(f"Task '{task['Tarefa']}' created successfully", "success")
+                                            update_log(f"Task '{task_name}' created successfully", "success")
                                             success_count += 1
                                     except Exception as e:
-                                        update_log(f"Error creating task '{task['Tarefa']}': {str(e)}", "error")
+                                        update_log(f"Error creating task '{task_name}': {str(e)}", "error")
                                         error_count += 1
                                 
                                 # Final summary
@@ -370,7 +369,6 @@ def main():
                                     
                                 # Move to next file
                                 st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                                st.experimental_rerun()
                                 
                         except Exception as e:
                             update_log(f"Error uploading to Notion: {str(e)}", "error")
@@ -378,7 +376,6 @@ def main():
                 with col2:
                     if st.button("⏭️ Skip File"):
                         st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                        st.experimental_rerun()
         
         # Download option for the current file
         st.subheader("📥 Download Processed Data")

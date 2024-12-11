@@ -95,12 +95,23 @@ class TaskOperations:
     def create_task_properties(self, task: pd.Series, project_id: str) -> Dict[str, Any]:
         """Create task properties for Notion API"""
         try:
-            task_name = task[self._field_mappings["title"]["notion"]]  # Use Notion field name
+            task_name = task[self._field_mappings["title"]["notion"]]
             logger.info(f"\n[TASK DEBUG] Creating properties for task: {task_name}")
             properties = self._prepare_task_properties(task)
+            
+            # Add project relation
             properties["Project"] = {"relation": [{"id": project_id}]}
+            
+            # Add parent task relation if exists
+            parent_edt = task.get("Parent task")
+            if parent_edt and pd.notna(parent_edt):
+                parent_task = self.find_task_by_edt(parent_edt, project_id)
+                if parent_task:
+                    properties["Parent task"] = {"relation": [{"id": parent_task["id"]}]}
+                else:
+                    logger.warning(f"Parent task with EDT {parent_edt} not found for task {task_name}")
+            
             return properties
-
         except Exception as e:
             logger.error(f"Error creating task properties: {str(e)}")
             raise
@@ -150,61 +161,40 @@ class TaskOperations:
             logger.error(f"Error checking for existing task: {str(e)}")
             return None
 
-    def create_or_update_task(self, task: pd.Series, project_id: str) -> Optional[str]:
-        """Create a new task or update existing task in Notion"""
+    def find_task_by_edt(self, edt: str, project_id: str) -> Optional[Dict[str, Any]]:
+        """Find a task by its EDT within a project"""
         try:
-            task_name = task["Tarefa"]
-            edt = task.get("EDT")
+            response = handle_api_call(
+                self.notion,
+                self._rate_limit_delay,
+                self._max_retries,
+                self._retry_delay,
+                self.notion.databases.query,
+                database_id=self._tasks_db,
+                filter={
+                    "and": [
+                        {
+                            "property": self._field_mappings["edt"]["notion"],
+                            "rich_text": {
+                                "equals": edt
+                            }
+                        },
+                        {
+                            "property": "Project",
+                            "relation": {
+                                "contains": project_id
+                            }
+                        }
+                    ]
+                }
+            )
             
-            # Check if task already exists
-            existing_task = self.find_existing_task(task_name, edt, project_id) if edt else None
-            
-            # Create properties for the task
-            properties = self.create_task_properties(task, project_id)
-            
-            if existing_task:
-                # Update existing task
-                try:
-                    logger.info(f"Updating existing task: {task_name} (EDT: {edt})")
-                    response = handle_api_call(
-                        self.notion,
-                        self._rate_limit_delay,
-                        self._max_retries,
-                        self._retry_delay,
-                        self.notion.pages.update,
-                        page_id=existing_task["id"],
-                        properties=properties
-                    )
-                    logger.info(f"Successfully updated task: {task_name}")
-                    return existing_task["id"]
-                except Exception as e:
-                    logger.error(f"Error updating task {task_name}: {str(e)}")
-                    logger.error(f"Properties sent: {properties}")
-                    raise e
-            else:
-                # Create new task
-                try:
-                    logger.info(f"Creating new task: {task_name} (EDT: {edt})")
-                    response = handle_api_call(
-                        self.notion,
-                        self._rate_limit_delay,
-                        self._max_retries,
-                        self._retry_delay,
-                        self.notion.pages.create,
-                        parent={"database_id": self._tasks_db},
-                        properties=properties
-                    )
-                    logger.info(f"Successfully created task: {task_name}")
-                    return response["id"]
-                except Exception as e:
-                    logger.error(f"Error creating task {task_name}: {str(e)}")
-                    logger.error(f"Properties sent: {properties}")
-                    raise e
-                    
+            if response['results']:
+                return response['results'][0]
+            return None
         except Exception as e:
-            logger.error(f"Error in create_or_update_task: {str(e)}")
-            logger.error(f"Task data: {task}")
-            raise e
+            logger.error(f"Error finding task by EDT: {str(e)}")
+            return None
 
     def find_task_by_name_and_project(self, task_name: str, project_id: str, task_data: Optional[pd.Series] = None) -> Optional[Dict[str, Any]]:
         """Find a task by its name, project ID, and other identifying fields."""
@@ -266,6 +256,62 @@ class TaskOperations:
         except Exception as e:
             logger.error(f"Error finding task: {str(e)}")
             return None
+
+    def create_or_update_task(self, task: pd.Series, project_id: str) -> Optional[str]:
+        """Create a new task or update existing task in Notion"""
+        try:
+            task_name = task[self._field_mappings["title"]["notion"]]
+            edt = task.get(self._field_mappings["edt"]["notion"])
+            
+            # Check if task already exists
+            existing_task = self.find_existing_task(task_name, edt, project_id) if edt else None
+            
+            # Create properties for the task
+            properties = self.create_task_properties(task, project_id)
+            
+            if existing_task:
+                # Update existing task
+                try:
+                    logger.info(f"Updating existing task: {task_name} (EDT: {edt})")
+                    response = handle_api_call(
+                        self.notion,
+                        self._rate_limit_delay,
+                        self._max_retries,
+                        self._retry_delay,
+                        self.notion.pages.update,
+                        page_id=existing_task["id"],
+                        properties=properties
+                    )
+                    logger.info(f"Successfully updated task: {task_name}")
+                    return existing_task["id"]
+                except Exception as e:
+                    logger.error(f"Error updating task {task_name}: {str(e)}")
+                    logger.error(f"Properties sent: {properties}")
+                    raise e
+            else:
+                # Create new task
+                try:
+                    logger.info(f"Creating new task: {task_name} (EDT: {edt})")
+                    response = handle_api_call(
+                        self.notion,
+                        self._rate_limit_delay,
+                        self._max_retries,
+                        self._retry_delay,
+                        self.notion.pages.create,
+                        parent={"database_id": self._tasks_db},
+                        properties=properties
+                    )
+                    logger.info(f"Successfully created task: {task_name}")
+                    return response["id"]
+                except Exception as e:
+                    logger.error(f"Error creating task {task_name}: {str(e)}")
+                    logger.error(f"Properties sent: {properties}")
+                    raise e
+                    
+        except Exception as e:
+            logger.error(f"Error in create_or_update_task: {str(e)}")
+            logger.error(f"Task data: {task}")
+            raise e
 
     def verify_task_creation(self, task_name: str, project_id: str, task_data: Optional[pd.Series] = None) -> bool:
         """Verify if a task was actually created in Notion"""

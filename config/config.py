@@ -134,7 +134,7 @@ def create_excel_config(config: Dict[str, Any]) -> ExcelConfig:
             use_edt_as_fallback=naming_config["use_edt_as_fallback"],
             unique_suffix_pattern=naming_config["unique_suffix_pattern"]
         ),
-        type_mapping=config["type_config"]["mappings"],
+        type_mapping=config["type_config"]["mapping"],
         status_mapping=config["status_config"]["mappings"],
         project_info_sheet=config["sheets"]["project_info"],
         tasks_sheet=config["sheets"]["tasks"],
@@ -181,7 +181,7 @@ def create_notion_config(config: Dict[str, Any]) -> NotionConfig:
         property_types=config["property_types"],
         api_settings=config["api_settings"],
         status_mapping=config["status_config"]["mappings"],
-        type_mapping=config["type_config"]["mappings"]
+        type_mapping=config["type_config"]["mapping"]
     )
 
 # Common configuration shared between Excel and Notion
@@ -189,21 +189,19 @@ COMMON_CONFIG: Dict[str, Any] = {
     "status_config": {
         "default": "Not started",
         "mappings": {
-            "Not started": "Not started",
-            "In progress": "In progress",
-            "Done": "Done",
+            "Não iniciado": "Not started",
+            "Em andamento": "In progress",
             "Concluído": "Done",
-            "Canceled": "Canceled",
-            "Archived": "Archived",
-            "Blocked": "Blocked",
-            "Parado": "Paused"
+            "Atrasado": "Delayed",
+            "Cancelado": "Cancelled"
         }
     },
     "type_config": {
         "default": "Tarefa",
-        "mappings": {
-            "M": "Milestone",
-            "T": "Tarefa"
+        "mapping": {
+            "Milestone": "Milestone",
+            "Fase": "Fase",
+            "Tarefa": "Tarefa"
         },
         "milestone_identifiers": {
             "suffix": ".M",
@@ -224,44 +222,44 @@ COMMON_CONFIG: Dict[str, Any] = {
     "field_mappings": {
         # Excel column name -> Notion property name
         "title": {
-            "excel": "FASES/TAREFAS",
             "notion": "Tarefa",
+            "excel": "FASES/TAREFAS",
             "type": "title"
         },
         "type": {
-            "excel": "TIPO",
             "notion": "Type",
+            "excel": "TIPO",
             "type": "select"
         },
         "edt": {
-            "excel": "EDT",
             "notion": "EDT",
+            "excel": "EDT",
             "type": "rich_text"
         },
         "status": {
-            "excel": "STATUS",
             "notion": "Status",
+            "excel": "STATUS",
             "type": "status"
         },
-        "phase": {
-            "excel": "Fase",  # This is computed, not from Excel
-            "notion": "Fase",
-            "type": "select"
+        "progress": {
+            "notion": "Progresso (dias)",
+            "excel": "TRABALHO REALIZADO",
+            "type": "number"
         },
         "planned_dates": {
-            "excel": ["INÍCIO", "FIM"],  # Array indicates composite field
             "notion": "Datas planeadas",
+            "excel": None,
             "type": "date"
         },
         "actual_dates": {
-            "excel": ["INÍCIO", "DATA FIM"],  # Array indicates composite field
             "notion": "Datas reais",
+            "excel": None,
             "type": "date"
         },
-        "progress": {
-            "excel": "TRABALHO REALIZADO",
-            "notion": "Progresso (dias)",
-            "type": "number"
+        "parent": {
+            "notion": "Parent task",
+            "excel": "EDT",
+            "type": "relation"
         }
     }
 }

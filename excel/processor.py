@@ -101,34 +101,25 @@ class DateProcessor:
         
         # Log available columns for debugging
         columns = [str(col) if not pd.isna(col) else 'nan' for col in data.columns]
-        logger.info(f"Available columns: {columns}")
-        logger.info(f"Looking for planned start in: {config.task_columns.planned_start}")
-        logger.info(f"Looking for planned end in: {config.task_columns.planned_end}")
-        logger.info(f"Looking for actual start in: {config.task_columns.actual_start}")
-        logger.info(f"Looking for actual end in: {config.task_columns.actual_end}")
         
         # Find the actual column names that best match our expected names
         def find_column(expected_name: str, df: pd.DataFrame) -> Optional[str]:
             # Convert all column names to strings and handle nan
             cols = {str(col) if not pd.isna(col) else '' for col in df.columns}
-            logger.debug(f"Looking for column '{expected_name}' in {cols}")
             
             # First try exact match
             if expected_name in cols:
-                logger.debug(f"Found exact match for '{expected_name}'")
                 return expected_name
             
             # Try case-insensitive match
             expected_lower = expected_name.lower()
             for col in cols:
                 if col.lower() == expected_lower:
-                    logger.debug(f"Found case-insensitive match: '{col}' for '{expected_name}'")
                     return col
             
             # Try finding column containing the name
             for col in cols:
                 if expected_name.lower() in col.lower():
-                    logger.debug(f"Found partial match: '{col}' for '{expected_name}'")
                     return col
             
             logger.warning(f"No match found for column '{expected_name}'")
@@ -140,16 +131,12 @@ class DateProcessor:
         actual_start_col = find_column(config.task_columns.actual_start, data)
         actual_end_col = find_column(config.task_columns.actual_end, data)
         
-        logger.info(f"Found columns: planned_start='{planned_start_col}', planned_end='{planned_end_col}', "
-                   f"actual_start='{actual_start_col}', actual_end='{actual_end_col}'")
-        
         for idx, row in data.iterrows():
             try:
                 # Process planned dates
                 if planned_start_col or planned_end_col:
                     start = cls.safe_convert_date(row[planned_start_col]) if planned_start_col else None
                     end = cls.safe_convert_date(row[planned_end_col]) if planned_end_col else None
-                    logger.debug(f"Row {idx} planned dates - start: {start}, end: {end}")
                     if start is not None or end is not None:
                         planned_dates[idx] = {"start": start, "end": end}
                 
@@ -157,15 +144,11 @@ class DateProcessor:
                 if actual_start_col or actual_end_col:
                     start = cls.safe_convert_date(row[actual_start_col]) if actual_start_col else None
                     end = cls.safe_convert_date(row[actual_end_col]) if actual_end_col else None
-                    logger.debug(f"Row {idx} actual dates - start: {start}, end: {end}")
                     if start is not None or end is not None:
                         real_dates[idx] = {"start": start, "end": end}
                         
             except Exception as e:
-                logger.error(f"Error processing dates for row {idx}: {e}", exc_info=True)
                 continue  # Skip rows with errors instead of failing
-        
-        logger.info(f"Processed {len(planned_dates)} planned dates and {len(real_dates)} real dates")
         return planned_dates, real_dates
 
 class ExcelProcessor:
@@ -187,29 +170,63 @@ class ExcelProcessor:
         project_info = {'name': None, 'id': None}
         
         try:
-            # Read the project info sheet
-            df = pd.read_excel(excel_file, sheet_name=self.config.project_info_sheet)
+            # Get available sheets and find the planning sheet
+            xl = pd.ExcelFile(excel_file)
+            available_sheets = xl.sheet_names
             
-            # Extract project name using configured columns
-            name_rows = df[df.iloc[:, self.config.fields.project.name.column] == self.config.fields.project.name.label]
-            if not name_rows.empty:
-                name_row = name_rows.iloc[0]
-                project_info['name'] = name_row.iloc[self.config.fields.project.name.value_column]
+            # Try different possible sheet names
+            sheet_names = ["PLANEAMENTO", "Planeamento", "planeamento"]
+            planning_sheet = None
             
-            # Extract project ID using configured columns
-            id_rows = df[df.iloc[:, self.config.fields.project.id.column] == self.config.fields.project.id.label]
-            if not id_rows.empty:
-                id_row = id_rows.iloc[0]
-                project_info['id'] = str(id_row.iloc[self.config.fields.project.id.value_column])
+            for sheet in available_sheets:
+                if sheet.upper() in [s.upper() for s in sheet_names]:
+                    planning_sheet = sheet
+                    break
             
-            if not project_info['name'] or not project_info['id']:
-                logger.error("Could not find project name or ID in the expected columns")
+            if not planning_sheet:
+                logger.error(f"Could not find planning sheet. Available sheets: {available_sheets}")
+                return project_info
+            # Read without headers first to see the actual data
+            df = pd.read_excel(excel_file, sheet_name=planning_sheet, header=None)
             
+            # Log first few rows for debugging
+            for idx in range(min(5, len(df))):
+                logger.info(f"Row {idx}: {df.iloc[idx].tolist()}")
+            
+            if not df.empty:
+                # Look through first few rows to find EDT and project name
+                for idx in range(min(10, len(df))):  # Check first 10 rows
+                    row = df.iloc[idx]
+                    row_data = [str(cell).strip() if not pd.isna(cell) else "" for cell in row]
+                    
+                    # Look for EDT-like value (usually starts with PR.)
+                    edt_value = None
+                    title_value = None
+                    
+                    for col_idx, value in enumerate(row_data):
+                        if value.startswith('PR.'):
+                            edt_value = value
+                            # Title is usually in the next column
+                            if col_idx + 1 < len(row_data):
+                                title_value = row_data[col_idx + 1]
+                            break
+                    
+                    if edt_value and title_value:
+                        project_info['id'] = edt_value
+                        project_info['name'] = title_value
+                        break
+                
+                if not project_info['name'] or not project_info['id']:
+                    logger.error(f"Could not find project name or ID in the {planning_sheet} sheet")
+            else:
+                logger.error(f"{planning_sheet} sheet is empty")
+                
         except Exception as e:
-            logger.error(f"Failed to extract project info: {e}")
+            logger.error(f"Failed to extract project info: {str(e)}")
+            logger.exception("Full traceback:")
         
         return project_info
-    
+
     def get_phase_edt(self, edt: str) -> Optional[str]:
         """Get the phase EDT from a task EDT"""
         if pd.isna(edt):
@@ -272,6 +289,20 @@ class ExcelProcessor:
             logger.error(f"Error extracting phase from EDT {edt}: {e}")
             return None
 
+    def get_parent_task(self, edt: str) -> Optional[str]:
+        """Get the parent task EDT from a task EDT"""
+        if pd.isna(edt):
+            return None
+        
+        parts = str(edt).strip().split('.')
+        if len(parts) <= 2:  # Project or no parent
+            return None
+            
+        # Get parent EDT by removing the last part
+        # PR.0001.1.1.1 -> PR.0001.1.1
+        parent_edt = '.'.join(parts[:-1])
+        return parent_edt
+
     def process_excel_data(self, excel_file: str) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
         """Process Excel data and return cleaned DataFrame ready for Notion import"""
         try:
@@ -314,14 +345,14 @@ class ExcelProcessor:
             logger.info(f"Identified {len(self._phase_titles)} phases")
             logger.debug(f"Phase titles: {self._phase_titles}")
             
-            # Filter out project and phase rows, keep only tasks and milestones
-            task_rows = all_rows[~(phase_mask | project_mask)].copy()
+            # Filter out only project rows, keep phases, tasks and milestones
+            task_rows = all_rows[~project_mask].copy()
             milestone_mask = task_rows.apply(self.is_milestone, axis=1)
             
             # Calculate statistics
             stats = {
                 'total_phases': len(self._phase_titles),
-                'total_tasks': len(task_rows) - sum(milestone_mask),
+                'total_tasks': len(task_rows) - sum(milestone_mask) - len(phase_rows),
                 'total_milestones': sum(milestone_mask)
             }
             logger.info(f"Statistics: {stats}")
@@ -351,10 +382,12 @@ class ExcelProcessor:
                     )
                 
                 elif field == "type":
-                    # Type field (Milestone or Tarefa)
+                    # Type field (Milestone, Phase, or Task)
                     def get_type(row):
                         if self.is_milestone(row):
                             return "Milestone"
+                        if self.is_phase(row):
+                            return "Fase"
                         type_col = self.config.task_columns.type
                         if type_col in row.index:
                             return self.config.type_mapping.get(row[type_col], "Tarefa")
@@ -388,6 +421,10 @@ class ExcelProcessor:
                 elif field == "phase":
                     # Phase field (computed from EDT)
                     notion_structure[notion_name] = task_rows[self.config.task_columns.edt].apply(self.extract_phase)
+                
+                elif field == "parent":
+                    # Parent task field (computed from EDT)
+                    notion_structure[notion_name] = task_rows[self.config.task_columns.edt].apply(self.get_parent_task)
                 
                 elif field == "progress":
                     # Progress field (direct mapping with numeric conversion)
