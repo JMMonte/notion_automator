@@ -1,394 +1,395 @@
+import os
 import streamlit as st
 import pandas as pd
-from notion.api import NotionOperator
-import os
-from typing import Dict, Any
+from notion_client import Client
 from dotenv import load_dotenv
-from excel.processor import ExcelProcessor
-from config.config import COMMON_CONFIG, EXCEL_CONFIG, NOTION_CONFIG, merge_config
-from datetime import datetime
-import logging
-import tempfile
 
 # Load environment variables
 load_dotenv()
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_PROJECTS_DB = "544bf32b74694b6287112b40ac3b6f27"
+NOTION_TASKS_DB = "012071410dfd4a4f857eefe333a5f6c4"
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+notion = Client(auth=NOTION_TOKEN)
 
-# Configure Streamlit page
-st.set_page_config(page_title="Notion Project Automator", page_icon="📊", layout="wide")
-pd.set_option('display.max_rows', None)
+# Status mapping configuration
+STATUS_CONFIG = {
+    "default": "Not started",
+    "mapping": {
+        "Não iniciado": "Not started",
+        "Em progresso": "In progress",
+        "Em andamento": "In progress",
+        "Concluído": "Done",
+        "Pausado": "Paused",
+        "Cancelado": "Canceled",
+        "Arquivado": "Archived"
+    }
+}
 
-def format_date_range(date_dict):
-    """Format a date dictionary into a readable string"""
-    if pd.isna(date_dict) or date_dict is None:
-        return ""
-    start = date_dict.get('start', '')
-    end = date_dict.get('end', '')
-    if start and end:
-        return f"{start} → {end}"
-    elif start:
-        return f"Start: {start}"
-    elif end:
-        return f"End: {end}"
-    return ""
-
-def init_notion_client() -> NotionOperator:
-    """Initialize Notion client with configuration"""
-    token = os.getenv("NOTION_TOKEN")
-    if not token:
-        raise ValueError("NOTION_TOKEN environment variable is not set. Please check your .env file.")
-    return NotionOperator(notion_token=token, config=NOTION_CONFIG)
-
-def init_excel_processor() -> ExcelProcessor:
-    """Initialize Excel processor with configuration"""
-    return ExcelProcessor(config=EXCEL_CONFIG)
-
-def main():
-    # Initialize session state
-    if 'processed_files' not in st.session_state:
-        st.session_state.processed_files = {}
-    if 'uploaded_to_notion' not in st.session_state:
-        st.session_state.uploaded_to_notion = set()
-    if 'upload_logs' not in st.session_state:
-        st.session_state.upload_logs = {}
-    if 'widget_counter' not in st.session_state:
-        st.session_state.widget_counter = 0
-    if 'current_file_index' not in st.session_state:
-        st.session_state.current_file_index = 0
-    
-    st.title("Notion Project Automator 📊")
-    
-    # Initialize processors
+# Step 1: Load and clean the "PLANEAMENTO" sheet
+def load_and_clean_sheet(file) -> pd.DataFrame:
     try:
-        notion = init_notion_client()
-        excel_processor = init_excel_processor()
+        # First read to find the header row
+        planeamento_data: pd.DataFrame = pd.read_excel(
+            io=file,
+            sheet_name="PLANEAMENTO",
+            header=None,
+            engine="openpyxl"
+        )
+        
+        # Find the header row containing "FASES/TAREFAS"
+        mask = planeamento_data.apply(lambda row: row.astype(str).str.contains("FASES/TAREFAS", na=False).any(), axis=1)
+        header_row_idx: int = mask.loc[mask].index.tolist()[0]
+        
+        # Second read with the correct header
+        initial_cleaned_data: pd.DataFrame = pd.read_excel(
+            io=file,
+            sheet_name="PLANEAMENTO",
+            header=header_row_idx,
+            engine="openpyxl"
+        )
+        return initial_cleaned_data.dropna(how="all").reset_index(drop=True)
     except Exception as e:
-        st.error(f"Failed to initialize processors: {str(e)}")
-        return
+        st.error(f"Error reading Excel file: {str(e)}")
+        raise
 
-    # File uploader section
-    st.header("1. Upload Excel Files")
-    uploaded_files = st.file_uploader(
-        "Choose Excel files",
-        type=["xlsx", "xls"],
-        accept_multiple_files=True,
-        help="Upload one or more Excel files containing project data"
+# Step 2: Determine "Type" (Fase, Tarefa, or Milestone) and identify parent tasks
+def classify_and_identify_parent_tasks(data):
+    data_with_types = data.copy()
+
+    # Classify rows as Fase, Tarefa, or Milestone
+    data_with_types["Type"] = data_with_types.apply(
+        lambda row: "Milestone" if "MILESTONE:" in str(row["FASES/TAREFAS"]) else (
+            "Fase" if pd.notna(row["FASES/TAREFAS"]) and pd.isna(row["RESPONSÁVEL"]) else "Tarefa"
+        ),
+        axis=1,
     )
 
-    if not uploaded_files:
-        st.info("""
-        👋 Welcome to the Notion Project Automator!
-        
-        This tool helps you automate the process of creating and updating project tasks in Notion.
-        
-        Get started by uploading your Excel files above.
-        """)
-        return
+    data_with_types["Parent Task"] = None
 
-    total_files = len(uploaded_files)
-    st.write(f"📁 {total_files} file(s) selected")
+    parent_stack = []
+
+    for idx, row in data_with_types.iterrows():
+        if row["Type"] == "Fase":
+            parent_stack = [row["EDT"]]
+        elif row["Type"] in ["Tarefa", "Milestone"]:
+            if parent_stack:
+                data_with_types.at[idx, "Parent Task"] = parent_stack[-1]
+
+    return data_with_types
+
+# Step 3: Handle planned and real dates
+def process_dates(data):
+    date_cleaned_data = data.copy()
     
-    # Display current file being processed
-    if uploaded_files:
-        current_file = uploaded_files[st.session_state.current_file_index]
-        st.subheader(f"Currently Processing: {current_file.name} ({st.session_state.current_file_index + 1}/{total_files})")
-        
-        # Initialize log container for current file
-        if current_file.name not in st.session_state.upload_logs:
-            st.session_state.upload_logs[current_file.name] = []
-        
-        log_container = st.empty()
-        
-        def update_log(message, message_type="info"):
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            emoji_map = {
-                "info": "ℹ️",
-                "success": "✅",
-                "warning": "⚠️",
-                "error": "❌"
+    # Get the real dates columns by name
+    real_start_col = "INÍCIO.1"  # Index 11
+    real_end_col = "DATA FIM"    # Index 16
+    
+    # Get other columns by name patterns
+    planned_start_col = "INÍCIO"  # Index 5
+    planned_end_col = "FIM"      # Index 9
+    status_col = "STATUS"        # Index 18
+
+    # Process dates and convert to date objects (removing time)
+    date_cleaned_data["Real Start"] = pd.to_datetime(date_cleaned_data[real_start_col]).dt.date
+    date_cleaned_data["Real End"] = pd.to_datetime(date_cleaned_data[real_end_col]).dt.date
+    date_cleaned_data["Planned Start"] = pd.to_datetime(date_cleaned_data[planned_start_col]).dt.date
+    date_cleaned_data["Planned End"] = pd.to_datetime(date_cleaned_data[planned_end_col]).dt.date
+
+    date_cleaned_data.rename(
+        columns={status_col: "Status"},
+        inplace=True,
+    )
+
+    # Ensure dates are valid and start <= end
+    def validate_dates(start, end):
+        if pd.notna(start) and pd.notna(end):
+            if start > end:
+                return start, None  # Ignore the end date if invalid
+        return start if pd.notna(start) else None, end if pd.notna(end) else None
+
+    date_cleaned_data["Planned Start"], date_cleaned_data["Planned End"] = zip(
+        *date_cleaned_data.apply(lambda row: validate_dates(row["Planned Start"], row["Planned End"]), axis=1)
+    )
+
+    date_cleaned_data["Datas planeadas"] = date_cleaned_data.apply(
+        lambda row: f"{row['Planned Start']} → {row['Planned End']}" if pd.notna(row["Planned End"]) else f"{row['Planned Start']}",
+        axis=1,
+    )
+    date_cleaned_data["Datas reais"] = date_cleaned_data.apply(
+        lambda row: f"{row['Real Start']} → {row['Real End']}" if pd.notna(row["Real End"]) else (f"{row['Real Start']}" if pd.notna(row["Real Start"]) else ""),
+        axis=1,
+    )
+
+    return date_cleaned_data
+
+# Step 4: Update EDT values based on hierarchy
+def update_edt(data):
+    edt_data = data.copy()
+    edt_data["EDT"] = edt_data["EDT"]  # Use the original EDT directly
+
+    for idx, row in edt_data.iterrows():
+        if row["Type"] == "Milestone" and ".M" in str(row["EDT"]):
+            edt_data.at[idx, "EDT"] = row["EDT"]  # Retain the .M suffix for milestones
+
+    return edt_data
+
+# Step 5: Extract project info
+def extract_project_info(data):
+    project_info = data.iloc[0].to_dict()
+    remaining_data = data.iloc[1:].reset_index(drop=True)
+    return project_info, remaining_data
+
+# Step 6: Create Notion-ready structure
+def create_notion_structure(data):
+    columns = ["Tarefa", "Type", "Parent Task", "EDT", "Datas planeadas", "Datas reais", "Trabalho Realizado", "Status"]
+    notion_structure = pd.DataFrame({col: [] for col in columns})
+
+    notion_structure["Tarefa"] = data["FASES/TAREFAS"]
+    notion_structure["Type"] = data["Type"]
+    notion_structure["Parent Task"] = data["Parent Task"]
+    notion_structure["EDT"] = data["EDT"]
+    notion_structure["Datas planeadas"] = data["Datas planeadas"]
+    notion_structure["Datas reais"] = data["Datas reais"]
+    notion_structure["Trabalho Realizado"] = data.get("TRABALHO REALIZADO", "")  # Include "Trabalho Realizado" column
+    notion_structure["Status"] = data.get("Status", STATUS_CONFIG["default"])
+
+    return notion_structure
+
+# Step 7: Notion Integration
+# Search for a project by ID in the Notion database
+def search_project(project_id):
+    results = notion.databases.query(
+        database_id=NOTION_PROJECTS_DB,
+        filter={
+            "property": "ID",
+            "rich_text": {
+                "equals": project_id
             }
-            emoji = emoji_map.get(message_type, "ℹ️")
-            log_entry = f"[{timestamp}] {emoji} {message}"
-            st.session_state.upload_logs[current_file.name].append(log_entry)
-            
-            # Increment counter for unique key
-            st.session_state.widget_counter += 1
-            log_key = f"log_{current_file.name}_{st.session_state.widget_counter}"
-            
-            # Update log display
-            log_container.text_area(
-                "Upload Progress Log",
-                "\n".join(st.session_state.upload_logs[current_file.name]),
-                height=200,
-                key=log_key
-            )
+        }
+    )
+    return results.get("results", [])
+
+# Create a new project in Notion
+def create_project(project_info):
+    return notion.pages.create(
+        **{
+            "parent": {"database_id": NOTION_PROJECTS_DB},
+            "properties": {
+                "Project name": {"title": [{"text": {"content": project_info["FASES/TAREFAS"]}}]},
+                "ID": {"rich_text": [{"text": {"content": project_info["EDT"]}}]},
+            }
+        }
+    )
+
+# Update an existing task by EDT
+def update_task(task_id, task, project_id):
+    status = STATUS_CONFIG["mapping"].get(task["Status"], STATUS_CONFIG["default"])
+    parent_relation = []
+    if task["Parent Task"]:
+        parent_task_id = find_task_by_edt(task["Parent Task"])
+        if parent_task_id:
+            parent_relation = [{"id": parent_task_id}]
+
+    notion.pages.update(
+        page_id=task_id,
+        properties={
+            "Tarefa": {"title": [{"text": {"content": task["Tarefa"]}}]},
+            "Type": {"select": {"name": task["Type"]}},
+            "EDT": {"rich_text": [{"text": {"content": task["EDT"]}}]},
+            "Project": {"relation": [{"id": project_id}]},
+            "Parent task": {"relation": parent_relation},
+            "Datas planeadas": {"date": {"start": task["Datas planeadas"].split(" → ")[0],
+                                             "end": task["Datas planeadas"].split(" → ")[1] if " → " in task["Datas planeadas"] else None}},
+            "Datas reais": {"date": {"start": task["Datas reais"].split(" → ")[0],
+                                         "end": task["Datas reais"].split(" → ")[1] if " → " in task["Datas reais"] else None}},
+            "Progresso (dias)": {"number": float(task["Trabalho Realizado"])}
+        }
+    )
+
+# Check for existing tasks by EDT and return its ID if found
+def find_task_by_edt(edt):
+    results = notion.databases.query(
+        database_id=NOTION_TASKS_DB,
+        filter={
+            "property": "EDT",
+            "rich_text": {
+                "equals": edt
+            }
+        }
+    )
+    if results.get("results"):
+        return results["results"][0]["id"]
+    return None
+
+# Upload or update tasks in Notion
+def upload_tasks(tasks, project_id):
+    # Create progress containers
+    progress_container = st.empty()
+    status_container = st.empty()
+    error_container = st.empty()
+    
+    # Initialize counters
+    total_tasks = len(tasks)
+    created_count = 0
+    updated_count = 0
+    error_count = 0
+    errors = []
+
+    for idx, (_, task) in enumerate(tasks.iterrows()):
+        # Update progress
+        progress = (idx + 1) / total_tasks
+        progress_container.progress(progress)
+        status_container.write(f"Processing {idx + 1}/{total_tasks} tasks: {task['EDT']}")
         
-        # Process current file if not already processed
-        if current_file.name not in st.session_state.processed_files:
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
-                    tmp_file.write(current_file.getvalue())
-                    temp_path = tmp_file.name
+        try:
+            task_id = find_task_by_edt(task["EDT"])
+            if task_id:
+                update_task(task_id, task, project_id)
+                updated_count += 1
+            else:
+                status = STATUS_CONFIG["mapping"].get(task["Status"], STATUS_CONFIG["default"])
+                parent_relation = []
+                if task["Parent Task"]:
+                    parent_task_id = find_task_by_edt(task["Parent Task"])
+                    if parent_task_id:
+                        parent_relation = [{"id": parent_task_id}]
 
-                # Process the file using excel_processor
-                project_info = excel_processor.get_project_info(temp_path)
-                if not project_info['name'] or not project_info['id']:
-                    st.error(f"❌ Could not extract project information from {current_file.name}")
-                    if st.button("Skip File"):
-                        st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                    return
-
-                # Process the Excel data
-                notion_structure, stats, metadata = excel_processor.process_excel_data(temp_path)
-
-                # Header verification step
-                st.subheader("2. Verify Headers")
-                st.write("Please verify that your Excel headers match the expected Notion headers:")
-                
-                # Get expected headers from config
-                required_headers = {
-                    'EDT': excel_processor.config.task_columns.edt,
-                    'Title': excel_processor.config.task_columns.title,
-                    'Status': excel_processor.config.task_columns.status,
-                    'Progress': excel_processor.config.task_columns.progress,
-                    'Planned Start': excel_processor.config.task_columns.planned_start,
-                    'Planned End': excel_processor.config.task_columns.planned_end,
-                    'Actual Start': excel_processor.config.task_columns.actual_start,
-                    'Actual End': excel_processor.config.task_columns.actual_end,
-                }
-                
-                optional_headers = {
-                    'Type': excel_processor.config.task_columns.type,
-                }
-                
-                # Get actual headers from the DataFrame
-                actual_headers = list(metadata['headers'])
-                
-                # Create a comparison DataFrame for required headers
-                comparison_data = []
-                for field, expected in required_headers.items():
-                    found = expected in actual_headers
-                    comparison_data.append({
-                        'Field': field,
-                        'Expected Header': expected,
-                        'Required': '✅',
-                        'Found': '✅' if found else '❌'
-                    })
-                
-                # Add optional headers to comparison
-                for field, expected in optional_headers.items():
-                    found = expected in actual_headers
-                    comparison_data.append({
-                        'Field': field,
-                        'Expected Header': expected,
-                        'Required': '❌',
-                        'Found': '✅' if found else '❌'
-                    })
-                
-                comparison_df = pd.DataFrame(comparison_data)
-                st.dataframe(comparison_df, use_container_width=True)
-                
-                # Check if all required headers are present
-                missing_headers = [h for h in required_headers.values() if h not in actual_headers]
-                if missing_headers:
-                    st.error(f"❌ Missing required headers: {', '.join(missing_headers)}")
-                    if st.button("Skip File"):
-                        st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                    return
-                
-                # Ask for user confirmation
-                if not st.checkbox("I confirm that the headers are correct", key=f"header_confirm_{current_file.name}"):
-                    st.info("Please confirm the headers are correct to proceed with the upload")
-                    return
-
-                # Store processed data in session state
-                st.session_state.processed_files[current_file.name] = {
-                    'project_info': project_info,
-                    'stats': stats,
-                    'metadata': metadata,
-                    'notion_structure': notion_structure
-                }
-
-            except Exception as e:
-                st.error(f"❌ Error processing {current_file.name}: {str(e)}")
-                if st.button("Skip File"):
-                    st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                return
-            finally:
-                # Clean up temporary file
-                try:
-                    os.unlink(temp_path)
-                except Exception as e:
-                    logger.error(f"Error cleaning up temporary file for {current_file.name}: {str(e)}")
-        
-        # Get processed data
-        file_data = st.session_state.processed_files[current_file.name]
-        project_info = file_data['project_info']
-        stats = file_data['stats']
-        metadata = file_data['metadata']
-        notion_structure = file_data['notion_structure']
-        
-        # Create tabs for the current file
-        tab1, tab2, tab3 = st.tabs([
-            "📋 Project Info",
-            "🔍 Preview",
-            "✨ Notion"
-        ])
-        
-        with tab1:
-            st.markdown(f"""
-            ### Project Information
-            - **Name**: {project_info['name']}
-            - **ID**: {project_info['id']}
-            
-            📊 **File Statistics:**
-            - Total Phases: {stats['total_phases']}
-            - Total Tasks: {stats['total_tasks']}
-            - Total Milestones: {stats['total_milestones']}
-            """)
-            
-        with tab2:
-            st.dataframe(notion_structure)
-            
-        with tab3:
-            st.subheader("Similar Projects Check")
-            similar_projects = notion.projects.find_similar_projects(
-                project_info['name'],  # Use consistent 'name' key
-                project_info['id']
-            )
-            
-            selected_project = None
-            if similar_projects:
-                with st.expander("⚠️ Similar Projects Found", expanded=True):
-                    st.write("Select a project to add tasks to, or create a new one:")
-                    
-                    # Add "Create New Project" option
-                    project_options = [{"Project name": "📌 Create New Project", "id": None, "url": None}] + [
-                        {
-                            "Project name": result.get("properties", {}).get("Project name", {}).get("title", [{}])[0].get("text", {}).get("content", "Untitled"),
-                            "id": result.get("id"),
-                            "url": result.get("url")
+                notion.pages.create(
+                    **{
+                        "parent": {"database_id": NOTION_TASKS_DB},
+                        "properties": {
+                            "Tarefa": {"title": [{"text": {"content": task["Tarefa"]}}]},
+                            "Type": {"select": {"name": task["Type"]}},
+                            "EDT": {"rich_text": [{"text": {"content": task["EDT"]}}]},
+                            "Project": {"relation": [{"id": project_id}]},
+                            "Parent task": {"relation": parent_relation},
+                            "Datas planeadas": {"date": {"start": task["Datas planeadas"].split(" → ")[0],
+                                                         "end": task["Datas planeadas"].split(" → ")[1] if " → " in task["Datas planeadas"] else None}},
+                            "Datas reais": {"date": {"start": task["Datas reais"].split(" → ")[0] if task["Datas reais"] else None,
+                                                     "end": task["Datas reais"].split(" → ")[1] if task["Datas reais"] and " → " in task["Datas reais"] else None}},
+                            "Progresso (dias)": {"number": float(task["Trabalho Realizado"])},
+                            "Status": {"status": {"name": status}}
                         }
-                        for result in similar_projects
-                    ]
-                    
-                    selected_idx = st.radio(
-                        "Project Selection",
-                        range(len(project_options)),
-                        format_func=lambda i: project_options[i]["Project name"],
-                        key=f"project_select_{current_file.name}"
-                    )
-                    
-                    selected_project = project_options[selected_idx]
-                    
-                    if selected_idx > 0:  # If an existing project is selected
-                        st.markdown(f"""
-                        **Selected Project Details:**
-                        - ID: `{selected_project['id']}`
-                        - [View in Notion]({selected_project['url']})
-                        """)
-            else:
-                st.success("✅ No similar projects found - A new project will be created")
+                    }
+                )
+                created_count += 1
+        except Exception as e:
+            error_count += 1
+            errors.append(f"Error processing task {task['EDT']}: {str(e)}")
             
-            # Check if file has been uploaded to Notion
-            if current_file.name in st.session_state.uploaded_to_notion:
-                st.success(f"✅ Already uploaded to Notion")
-                # Show previous logs if any
-                if st.session_state.upload_logs[current_file.name]:
-                    st.session_state.widget_counter += 1
-                    log_key = f"log_{current_file.name}_{st.session_state.widget_counter}"
-                    log_container.text_area(
-                        "Upload Progress Log",
-                        "\n".join(st.session_state.upload_logs[current_file.name]),
-                        height=200,
-                        key=log_key
-                    )
-            else:
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("🚀 Upload to Notion"):
-                        try:
-                            project = None
-                            if selected_project and selected_project.get("id"):
-                                # Use existing project
-                                update_log(f"Adding tasks to existing project '{selected_project['Project name']}'...", "info")
-                                project = selected_project
-                            else:
-                                # Create new project
-                                update_log(f"Creating new project '{project_info['name']}'...", "info")
-                                try:
-                                    project = notion.projects.create_project(project_info)
-                                    if not project:
-                                        update_log("Failed to create project", "error")
-                                        st.error("❌ Failed to create project")
-                                        return
-                                except Exception as e:
-                                    update_log(f"Error creating project: {str(e)}", "error")
-                                    st.error(f"❌ Error creating project: {str(e)}")
-                                    return
-                        
-                            if project:
-                                if selected_project and selected_project.get("id"):
-                                    update_log(f"Using existing project '{selected_project['Project name']}'", "success")
-                                else:
-                                    update_log(f"Project '{project_info['name']}' created successfully", "success")
-                                
-                                total_tasks = len(notion_structure)
-                                success_count = 0
-                                skip_count = 0
-                                error_count = 0
-                                
-                                update_log(f"Creating {total_tasks} tasks...", "info")
-                                for idx, task in notion_structure.iterrows():
-                                    try:
-                                        task_name = task[notion.tasks._field_mappings["title"]["notion"]]
-                                        response = notion.tasks.create_or_update_task(task, project["id"])
-                                        if response is None:
-                                            update_log(f"Task '{task_name}' already exists, skipped", "warning")
-                                            skip_count += 1
-                                        else:
-                                            update_log(f"Task '{task_name}' created successfully", "success")
-                                            success_count += 1
-                                    except Exception as e:
-                                        update_log(f"Error creating task '{task_name}': {str(e)}", "error")
-                                        error_count += 1
-                                
-                                # Final summary
-                                update_log("\n=== Final Summary ===", "info")
-                                update_log(f"Total tasks processed: {total_tasks}", "info")
-                                update_log(f"Successfully created: {success_count}", "success")
-                                update_log(f"Skipped: {skip_count}", "warning")
-                                update_log(f"Errors: {error_count}", "error")
-                                
-                                # Mark as uploaded if at least one task was created
-                                if success_count > 0:
-                                    st.session_state.uploaded_to_notion.add(current_file.name)
-                                    
-                                # Move to next file
-                                st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
-                                
-                        except Exception as e:
-                            update_log(f"Error uploading to Notion: {str(e)}", "error")
-                
-                with col2:
-                    if st.button("⏭️ Skip File"):
-                        st.session_state.current_file_index = min(st.session_state.current_file_index + 1, total_files - 1)
+        # Update status message
+        status_text = f"""
+        **Progress Summary:**
+        - Created: {created_count}
+        - Updated: {updated_count}
+        - Errors: {error_count}
+        """
+        status_container.markdown(status_text)
         
-        # Download option for the current file
-        st.subheader("📥 Download Processed Data")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_filename = f"notion_ready_structure_{current_file.name}_{timestamp}.csv"
+        # Show errors if any
+        if errors:
+            error_text = "**Errors:**\n" + "\n".join(f"- {error}" for error in errors[-5:])
+            if len(errors) > 5:
+                error_text += f"\n- ... and {len(errors) - 5} more errors"
+            error_container.markdown(error_text)
+    
+    # Final summary
+    progress_container.empty()
+    status_container.markdown(f"""
+    **Upload Complete!**
+    - Total tasks processed: {total_tasks}
+    - Successfully created: {created_count}
+    - Successfully updated: {updated_count}
+    - Errors encountered: {error_count}
+    """)
+
+# Main processing function
+def process_excel(file):
+    progress_container = st.empty()
+    status_container = st.empty()
+    
+    # Define processing steps
+    total_steps = 6
+    current_step = 0
+    
+    def update_progress(step_name):
+        nonlocal current_step
+        current_step += 1
+        progress = current_step / total_steps
+        progress_container.progress(progress)
+        status_container.markdown(f"**Step {current_step}/{total_steps}:** {step_name}")
+    
+    update_progress("Loading and cleaning Excel data")
+    initial_cleaned_data = load_and_clean_sheet(file)
+    
+    update_progress("Classifying tasks and identifying parent tasks")
+    classified_data = classify_and_identify_parent_tasks(initial_cleaned_data)
+    
+    update_progress("Processing dates")
+    dated_data = process_dates(classified_data)
+    
+    update_progress("Updating EDT values")
+    updated_edt_data = update_edt(dated_data)
+    
+    update_progress("Extracting project information")
+    project_info, task_data = extract_project_info(updated_edt_data)
+    
+    update_progress("Creating Notion structure")
+    notion_structure = create_notion_structure(task_data)
+    
+    # Clear progress display
+    progress_container.empty()
+    status_container.empty()
+    
+    return project_info, notion_structure
+
+# Streamlit app
+st.title("Notion Data Transformation App")
+
+uploaded_file = st.file_uploader("Upload an Excel file", type="xlsx")
+
+if uploaded_file is not None:
+    project_info, processed_data = process_excel(uploaded_file)
+    st.write("Processed Data:")
+    st.dataframe(processed_data)
+
+    # Notion Integration
+    project_matches = search_project(project_info["EDT"])
+    if project_matches:
+        st.write("Matching projects found in Notion:")
+        project_options = []
+        project_ids = {}  # Using dict to store id mapping
         
-        csv = notion_structure.to_csv(index=False)
-        st.download_button(
-            label="Download CSV",
-            data=csv,
-            file_name=csv_filename,
-            mime="text/csv"
+        # Add existing projects
+        for match in project_matches:
+            project_name = match["properties"]["Project name"]["title"][0]["text"]["content"]
+            project_options.append(project_name)
+            project_ids[project_name] = match["id"]
+        
+        # Add create new option
+        project_options.append("Create a new project")
+        
+        selected_option = st.radio(
+            "Select a project or create a new one:",
+            project_options,
+            index=0  # Default to first matched project
         )
 
-if __name__ == "__main__":
-    main()
+        if selected_option == "Create a new project":
+            if st.button("Create new project and upload tasks"):
+                new_project = create_project(project_info)
+                upload_tasks(processed_data, new_project["id"])
+                st.success("Project created and tasks uploaded successfully!")
+        else:
+            selected_project_id = project_ids[selected_option]
+            if st.button("Upload tasks to selected project"):
+                upload_tasks(processed_data, selected_project_id)
+                st.success("Tasks uploaded successfully!")
+    else:
+        st.write("No matching project found in Notion.")
+        if st.button("Create new project and upload tasks"):
+            new_project = create_project(project_info)
+            upload_tasks(processed_data, new_project["id"])
+            st.success("Project created and tasks uploaded successfully!")
