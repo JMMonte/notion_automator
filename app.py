@@ -21,6 +21,7 @@ STATUS_CONFIG = {
         "Em andamento": "In progress",
         "Concluído": "Done",
         "Pausado": "Paused",
+        "PARADO": "Paused",
         "Cancelado": "Canceled",
         "Arquivado": "Archived"
     }
@@ -57,24 +58,67 @@ def load_and_clean_sheet(file) -> pd.DataFrame:
 def classify_and_identify_parent_tasks(data):
     data_with_types = data.copy()
 
-    # Classify rows as Fase, Tarefa, or Milestone
-    data_with_types["Type"] = data_with_types.apply(
-        lambda row: "Milestone" if "MILESTONE:" in str(row["FASES/TAREFAS"]) else (
-            "Fase" if pd.notna(row["FASES/TAREFAS"]) and pd.isna(row["RESPONSÁVEL"]) else "Tarefa"
-        ),
-        axis=1,
-    )
-
+    # Initialize columns
+    data_with_types["Type"] = None
     data_with_types["Parent Task"] = None
+    data_with_types["Level"] = 0
 
-    parent_stack = []
-
+    # Dictionary to store the last item at each level
+    level_parents = {}
+    
     for idx, row in data_with_types.iterrows():
-        if row["Type"] == "Fase":
-            parent_stack = [row["EDT"]]
-        elif row["Type"] in ["Tarefa", "Milestone"]:
-            if parent_stack:
-                data_with_types.at[idx, "Parent Task"] = parent_stack[-1]
+        edt = row["EDT"]
+        task_name = str(row["FASES/TAREFAS"])
+        edt_str = str(edt)
+        edt_parts = edt_str.split('.')
+        
+        # Determine type based on content and structure
+        if "MILESTONE:" in task_name:
+            task_type = "Milestone"
+        # PR.XXXX is project level
+        elif len(edt_parts) == 2:
+            task_type = "Fase"
+        # PR.XXXX.Y is phase level
+        elif len(edt_parts) == 3 and edt_parts[2].isdigit() and len(edt_parts[2]) <= 2:
+            task_type = "Fase"
+        elif pd.isna(row["RESPONSÁVEL"]):
+            task_type = "Fase"
+        else:
+            task_type = "Tarefa"
+            
+        data_with_types.at[idx, "Type"] = task_type
+        
+        # Special handling for milestone with .M
+        if edt_str.endswith('.M'):
+            # For PR.0001.1.4.M, we want PR.0001.1 as parent
+            edt_parts = edt_str[:-2].split('.')  # Remove .M first
+            if len(edt_parts) > 2:  # If we have more than just project and phase
+                parent_edt = '.'.join(edt_parts[:-1])  # Join all parts except the last number
+                data_with_types.at[idx, "Parent Task"] = parent_edt
+                data_with_types.at[idx, "Level"] = len(edt_parts) - 2  # Set level one above parent
+            else:
+                data_with_types.at[idx, "Level"] = len(edt_parts) - 1
+        else:
+            # Normal EDT handling
+            level = len(edt_parts) - 1
+            data_with_types.at[idx, "Level"] = level
+            
+            # Clear any stored parents at deeper levels
+            levels_to_remove = [l for l in level_parents.keys() if l >= level]
+            for l in levels_to_remove:
+                del level_parents[l]
+            
+            # Set parent task based on the previous level
+            if level > 0:
+                parent_level = level - 1
+                if parent_level in level_parents:
+                    parent_edt = level_parents[parent_level]
+                    # Only set parent if the EDTs share the same prefix
+                    if str(edt).startswith(str(parent_edt).rsplit('.', 1)[0]):
+                        data_with_types.at[idx, "Parent Task"] = parent_edt
+            
+            # Store this item as potential parent for next items
+            level_parents[level] = edt
 
     return data_with_types
 
@@ -202,9 +246,10 @@ def update_task(task_id, task, project_id):
             "Parent task": {"relation": parent_relation},
             "Datas planeadas": {"date": {"start": task["Datas planeadas"].split(" → ")[0],
                                              "end": task["Datas planeadas"].split(" → ")[1] if " → " in task["Datas planeadas"] else None}},
-            "Datas reais": {"date": {"start": task["Datas reais"].split(" → ")[0],
-                                         "end": task["Datas reais"].split(" → ")[1] if " → " in task["Datas reais"] else None}},
-            "Progresso (dias)": {"number": float(task["Trabalho Realizado"])}
+            "Datas reais": {"date": {"start": task["Datas reais"].split(" → ")[0] if task["Datas reais"] else None,
+                                         "end": task["Datas reais"].split(" → ")[1] if task["Datas reais"] and " → " in task["Datas reais"] else None}},
+            "Progresso (dias)": {"number": float(task["Trabalho Realizado"])},
+            "Status": {"status": {"name": status}}
         }
     )
 
@@ -348,48 +393,73 @@ def process_excel(file):
 # Streamlit app
 st.title("Notion Data Transformation App")
 
-uploaded_file = st.file_uploader("Upload an Excel file", type="xlsx")
+uploaded_files = st.file_uploader("Upload Excel files", type="xlsx", accept_multiple_files=True)
 
-if uploaded_file is not None:
-    project_info, processed_data = process_excel(uploaded_file)
-    st.write("Processed Data:")
-    st.dataframe(processed_data)
+if uploaded_files:
+    # Overall progress
+    total_files = len(uploaded_files)
+    overall_progress = st.progress(0)
+    overall_status = st.empty()
+    
+    for file_index, uploaded_file in enumerate(uploaded_files, 1):
+        st.markdown(f"### Processing file: {uploaded_file.name}")
+        file_status = st.empty()
+        
+        try:
+            project_info, processed_data = process_excel(uploaded_file)
+            file_status.success(f"Successfully processed {uploaded_file.name}")
+            
+            with st.expander(f"Details for {uploaded_file.name}"):
+                st.write("Processed Data:")
+                st.dataframe(processed_data)
 
-    # Notion Integration
-    project_matches = search_project(project_info["EDT"])
-    if project_matches:
-        st.write("Matching projects found in Notion:")
-        project_options = []
-        project_ids = {}  # Using dict to store id mapping
-        
-        # Add existing projects
-        for match in project_matches:
-            project_name = match["properties"]["Project name"]["title"][0]["text"]["content"]
-            project_options.append(project_name)
-            project_ids[project_name] = match["id"]
-        
-        # Add create new option
-        project_options.append("Create a new project")
-        
-        selected_option = st.radio(
-            "Select a project or create a new one:",
-            project_options,
-            index=0  # Default to first matched project
-        )
+                # Notion Integration
+                project_matches = search_project(project_info["EDT"])
+                if project_matches:
+                    st.write("Matching projects found in Notion:")
+                    project_options = []
+                    project_ids = {}  # Using dict to store id mapping
+                    
+                    # Add existing projects
+                    for match in project_matches:
+                        project_name = match["properties"]["Project name"]["title"][0]["text"]["content"]
+                        project_options.append(project_name)
+                        project_ids[project_name] = match["id"]
+                    
+                    # Add create new option
+                    project_options.append("Create a new project")
+                    
+                    selected_option = st.radio(
+                        "Select a project or create a new one:",
+                        project_options,
+                        index=0,  # Default to first matched project
+                        key=f"project_select_{file_index}"  # Unique key for each file
+                    )
 
-        if selected_option == "Create a new project":
-            if st.button("Create new project and upload tasks"):
-                new_project = create_project(project_info)
-                upload_tasks(processed_data, new_project["id"])
-                st.success("Project created and tasks uploaded successfully!")
-        else:
-            selected_project_id = project_ids[selected_option]
-            if st.button("Upload tasks to selected project"):
-                upload_tasks(processed_data, selected_project_id)
-                st.success("Tasks uploaded successfully!")
-    else:
-        st.write("No matching project found in Notion.")
-        if st.button("Create new project and upload tasks"):
-            new_project = create_project(project_info)
-            upload_tasks(processed_data, new_project["id"])
-            st.success("Project created and tasks uploaded successfully!")
+                    if selected_option == "Create a new project":
+                        if st.button("Create new project and upload tasks", key=f"create_btn_{file_index}"):
+                            new_project = create_project(project_info)
+                            upload_tasks(processed_data, new_project["id"])
+                            st.success("Project created and tasks uploaded successfully!")
+                    else:
+                        selected_project_id = project_ids[selected_option]
+                        if st.button("Upload tasks to selected project", key=f"upload_btn_{file_index}"):
+                            upload_tasks(processed_data, selected_project_id)
+                            st.success("Tasks uploaded successfully!")
+                else:
+                    st.write("No matching project found in Notion.")
+                    if st.button("Create new project and upload tasks", key=f"create_btn_{file_index}"):
+                        new_project = create_project(project_info)
+                        upload_tasks(processed_data, new_project["id"])
+                        st.success("Project created and tasks uploaded successfully!")
+        
+        except Exception as e:
+            file_status.error(f"Error processing {uploaded_file.name}: {str(e)}")
+        
+        # Update overall progress
+        overall_progress.progress(file_index / total_files)
+        overall_status.text(f"Processed {file_index} of {total_files} files")
+    
+    overall_status.success(f"Completed processing all {total_files} files")
+else:
+    st.info("Please upload one or more Excel files to begin processing")
